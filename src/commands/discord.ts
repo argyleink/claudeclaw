@@ -1243,12 +1243,15 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     `[${new Date().toLocaleTimeString()}] Discord ${label}${mediaSuffix}: "${cleanContent.slice(0, 60)}${cleanContent.length > 60 ? "..." : ""}"`,
   );
 
-  // Typing indicator loop (Discord typing lasts 10s, fire every 8s)
-  const typingInterval = setInterval(() => sendTyping(config.token, channelId), 8000);
+  // Typing indicator loop (Discord typing lasts 10s, fire every 8s). Retargeted
+  // to replyChannelId below once a reply thread is resolved, so the indicator
+  // follows the reply instead of pinging a parent channel nobody's watching.
+  let typingChannelId = channelId;
+  const typingInterval = setInterval(() => sendTyping(config.token, typingChannelId), 8000);
   inFlightThreads.add(channelId);
 
   try {
-    await sendTyping(config.token, channelId);
+    await sendTyping(config.token, typingChannelId);
 
     let imagePath: string | null = null;
     let voicePath: string | null = null;
@@ -1481,6 +1484,14 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
           }
         }
       }
+    }
+
+    // Reply landed in a different channel than we started typing in (e.g. a
+    // fresh thread auto-created off the user's message) — retarget so the
+    // indicator shows up where the reply will actually appear.
+    if (replyChannelId !== typingChannelId) {
+      typingChannelId = replyChannelId;
+      sendTyping(config.token, replyChannelId).catch(() => {});
     }
 
     // Thread messages (including auto-created ones) get their own persistent session.

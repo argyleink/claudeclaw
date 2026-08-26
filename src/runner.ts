@@ -57,7 +57,7 @@ import {
 import { getSettings, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
-import { classifyReadOnly, queryOllama, LOCAL_SIGIL } from "./ollama";
+import { classifyReadOnly, queryOllama, queryGlimmerOutage, LOCAL_SIGIL } from "./ollama";
 import { isAuthError, handleAuthFailure } from "./auth-guard";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
@@ -106,6 +106,117 @@ export interface RunResult {
 }
 
 const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
+
+// --- Claude-down failsafe ---
+// A broken claude install (npm auto-update leaving the ~500-byte stub exe,
+// missing binary, wiped package dir — happened 2026-08-19) makes every spawn
+// fail fast with exit 127 / "Executable not found". When detected we:
+//   (a) flag the outage in claude-failsafe.json (the failsafe watch job and
+//       future calls short-circuit on it),
+//   (b) kick scripts/claude-failsafe.mjs to repair immediately,
+//   (c) route user-facing messages to local Muse Glimmer so the bot stays
+//       responsive; scheduled jobs/heartbeats are skipped quietly (the
+//       failsafe posts one outage alert — per-job spam helps nobody).
+const CLAUDE_DOWN_PATTERN = /Executable not found in \$?PATH|is not recognized as an internal|cannot find the (?:path|file) specified|spawn .+ENOENT|no such file or directory/i;
+const FAILSAFE_STATE_FILE = join(process.cwd(), ".claude/claudeclaw/claude-failsafe.json");
+const FAILSAFE_SCRIPT = join(process.cwd(), ".claude/claudeclaw/scripts/claude-failsafe.mjs");
+const USER_FACING_NAMES = new Set(["discord", "telegram", "send", "prompt"]);
+const FAILSAFE_STATE_FRESH_MS = 20 * 60 * 1000;
+
+async function readFailsafeState(): Promise<Record<string, unknown> | null> {
+  try { return JSON.parse(await readFile(FAILSAFE_STATE_FILE, "utf8")); } catch { return null; }
+}
+
+async function isKnownClaudeOutage(): Promise<boolean> {
+  const state = await readFailsafeState();
+  if (!state || state.status !== "down") return false;
+  const stamp = String(state.checkedAt ?? state.runnerFlaggedAt ?? "");
+  const age = Date.now() - new Date(stamp).getTime();
+  // A stale "down" flag (failsafe job not refreshing it) shouldn't block
+  // spawn attempts forever — fall through and let the spawn re-verify.
+  return Number.isFinite(age) && age < FAILSAFE_STATE_FRESH_MS;
+}
+
+async function markClaudeDown(reason: string): Promise<void> {
+  const state: Record<string, unknown> = (await readFailsafeState()) ?? {};
+  if (state.status !== "down") {
+    state.status = "down";
+    state.downSince = new Date().toISOString();
+  }
+  state.runnerReason = reason.slice(0, 300);
+  state.runnerFlaggedAt = new Date().toISOString();
+  try { await writeFile(FAILSAFE_STATE_FILE, JSON.stringify(state, null, 2), "utf8"); } catch {}
+}
+
+let lastFailsafeKickAt = 0;
+function kickFailsafe(): void {
+  // The failsafe watch job also runs every 10 minutes; this just shortens
+  // time-to-repair after the first failed spawn. At most one kick per 5 min.
+  if (Date.now() - lastFailsafeKickAt < 5 * 60 * 1000) return;
+  lastFailsafeKickAt = Date.now();
+  try {
+    const proc = Bun.spawn(["node", FAILSAFE_SCRIPT, "watch"], {
+      stdin: "ignore", stdout: "ignore", stderr: "ignore", windowsHide: true,
+    });
+    proc.unref();
+    console.warn(`[${new Date().toLocaleTimeString()}] Kicked claude-failsafe repair`);
+  } catch (err) {
+    console.error(`[${new Date().toLocaleTimeString()}] Failed to kick claude-failsafe: ${err}`);
+  }
+}
+
+function detectClaudeDown(exec: { rawStdout: string; stderr: string; exitCode: number }): string | null {
+  if (exec.exitCode === 0) return null;
+  if (exec.exitCode === 127) return `exit 127: ${exec.stderr.slice(0, 200) || "spawn failed"}`;
+  if (CLAUDE_DOWN_PATTERN.test(exec.stderr)) return exec.stderr.slice(0, 200);
+  // Only trust the pattern on stdout for short outputs — a long, successful-
+  // looking transcript that merely mentions these strings isn't an outage.
+  if (exec.rawStdout.length < 2000 && CLAUDE_DOWN_PATTERN.test(exec.rawStdout)) return exec.rawStdout.slice(0, 200);
+  return null;
+}
+
+const GLIMMER_OUTAGE_BANNER =
+  "⚠️ **Claude is down right now** — this is **Glimmer**, the local backup model (answers only, no tools/actions). The failsafe is repairing Claude automatically.";
+
+async function claudeDownFallback(name: string, prompt: string, reason: string, logFile: string): Promise<RunResult> {
+  await markClaudeDown(reason);
+  kickFailsafe();
+  console.error(`[${new Date().toLocaleTimeString()}] Claude down (${reason}) — failsafe engaged for "${name}"`);
+
+  if (!USER_FACING_NAMES.has(name)) {
+    // Scheduled job / heartbeat / trigger: skip quietly. Exit 0 + empty stdout
+    // so notify handlers post nothing; the failsafe posts the one real alert.
+    await Bun.write(logFile, [
+      `# ${name}`,
+      `Date: ${new Date().toISOString()}`,
+      `Mode: SKIPPED — Claude install down (${reason}); failsafe repairing`,
+      "",
+      "## Output",
+      "",
+    ].join("\n"));
+    return { stdout: "", stderr: "", exitCode: 0 };
+  }
+
+  let body: string;
+  try {
+    body = await queryGlimmerOutage(prompt);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[${new Date().toLocaleTimeString()}] Glimmer outage fallback also failed: ${msg}`);
+    body = `(Local Glimmer couldn't answer either: ${msg.slice(0, 200)}. I'll catch this up as soon as Claude is repaired.)`;
+  }
+  const stdout = `${GLIMMER_OUTAGE_BANNER}\n\n${body}`;
+  await Bun.write(logFile, [
+    `# ${name}`,
+    `Date: ${new Date().toISOString()}`,
+    `Mode: GLIMMER OUTAGE FALLBACK — Claude install down (${reason})`,
+    `Prompt: ${prompt}`,
+    "",
+    "## Output",
+    stdout,
+  ].join("\n"));
+  return { stdout, stderr: "", exitCode: 0 };
+}
 
 // Serial queue — prevents concurrent --resume on the same session
 // Global queue for non-thread messages (backward compatible)
@@ -481,6 +592,12 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   const securityArgs = buildSecurityArgs(security);
   const timeoutMs = settings.sessionTimeoutMs ?? CLAUDE_TIMEOUT_MS;
 
+  // Known outage (flagged by the failsafe watch job or a previous failed
+  // spawn): don't burn a doomed spawn per message — go straight to fallback.
+  if (await isKnownClaudeOutage()) {
+    return claudeDownFallback(name, prompt, "known outage (claude-failsafe.json)", logFile);
+  }
+
   console.log(
     `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
   );
@@ -541,6 +658,15 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     );
     exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
     usedFallback = true;
+  }
+
+  // Outage detected mid-run: the spawn failed or the stub exe answered.
+  {
+    const claudeDownReason = detectClaudeDown(exec);
+    if (claudeDownReason) {
+      if (appendParts.length > 0) unlink(syspromptFile).catch(() => {});
+      return claudeDownFallback(name, prompt, claudeDownReason, logFile);
+    }
   }
 
   // Claude auth is broken (expired/revoked key, login issue) rather than a
@@ -831,8 +957,20 @@ async function execQuick(name: string, prompt: string): Promise<RunResult> {
 
   const baseEnv = buildCleanEnv();
 
+  // Quick-session outage short-circuit + post-run detection (same failsafe
+  // as execClaude — general-channel messages flow through here).
+  if (await isKnownClaudeOutage()) {
+    return claudeDownFallback(name, prompt, "known outage (claude-failsafe.json)", logFile);
+  }
+
   console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (quick/${isNew ? "new" : `resume ${existing.sessionId.slice(0, 8)}`})`);
   const exec = await runClaudeOnce(args, model, api, baseEnv, timeoutMs);
+  {
+    const quickDownReason = detectClaudeDown(exec);
+    if (quickDownReason) {
+      return claudeDownFallback(name, prompt, quickDownReason, logFile);
+    }
+  }
 
   let stdout = exec.rawStdout;
   let sessionId = existing?.sessionId ?? "unknown";

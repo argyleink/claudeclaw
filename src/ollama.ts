@@ -110,3 +110,50 @@ export async function queryOllama(prompt: string, readerModel: string): Promise<
   const { response } = await res.json() as { response: string };
   return `${response.trim()} ${LOCAL_SIGIL}`;
 }
+
+// --- Claude-outage emergency fallback (Muse Glimmer) ---
+// runner.ts routes user-facing messages here when the Claude INSTALL itself
+// is broken (stub exe from a bad npm auto-update, missing binary). Distinct
+// from the disabled read-only routing above: this is a last-resort "stay
+// responsive" path, not a quality-parity one. The model is told explicitly
+// that Claude is down so it doesn't claim capabilities it lacks, and the
+// caller prepends a user-visible outage banner.
+const GLIMMER_MODEL = "muse-glimmer:30b";
+const GLIMMER_TIMEOUT_MS = 8 * 60 * 1000; // 30B on the 3060 Ti takes 2-4+ min, longer on a cold load
+const GLIMMER_CONTEXT_CAP = 12_000; // keep injected data inside the model's context window
+
+export async function queryGlimmerOutage(prompt: string): Promise<string> {
+  const files = gatherContextFiles(prompt);
+  let dataContext = buildDataContext(files);
+  if (dataContext.length > GLIMMER_CONTEXT_CAP) {
+    dataContext = dataContext.slice(0, GLIMMER_CONTEXT_CAP) + "\n...[truncated]";
+  }
+  const system = [
+    "You are Glimmer, Adam's local backup assistant (covering for PunkAss). Sharp, warm, brief — Discord-length replies.",
+    "EMERGENCY BACKUP MODE: Claude, the primary assistant, is currently DOWN (broken installation). You are covering until the automatic repair completes.",
+    "You have NO tools in this mode — never claim to have edited files, run commands, deployed, logged, or scheduled anything. If the request needs an action, say it'll be picked up once Claude is repaired.",
+    "The user already sees a banner saying Claude is down — don't re-explain it, just answer.",
+  ].join("\n\n");
+  const userPrompt = dataContext
+    ? `Relevant local data:\n\n${dataContext}\n\nUser message: ${prompt}`
+    : prompt;
+  const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: GLIMMER_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: userPrompt },
+      ],
+      stream: false,
+      think: false,
+      keep_alive: "10m",
+    }),
+    signal: AbortSignal.timeout(GLIMMER_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`Ollama outage fallback failed: ${res.status}`);
+  const data = await res.json() as { message?: { content?: string } };
+  const text = (data.message?.content ?? "").trim();
+  if (!text) throw new Error("Ollama outage fallback returned an empty response");
+  return `${text} ✨`;
+}
