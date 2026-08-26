@@ -54,6 +54,26 @@ interface DiscordAttachment {
   flags?: number;
 }
 
+// A forward's `message_reference.type` is FORWARD (1); a reply's is DEFAULT (0).
+const DISCORD_REFERENCE_TYPE_FORWARD = 1;
+
+interface DiscordMessageReference {
+  type?: number;
+  message_id?: string;
+  channel_id?: string;
+  guild_id?: string;
+}
+
+// Discord's snapshot deliberately omits `author` (anti-spoofing) — we can
+// never tell from the payload alone whose message got forwarded.
+interface DiscordMessageSnapshot {
+  message: {
+    type: number;
+    content: string;
+    attachments?: DiscordAttachment[];
+  };
+}
+
 interface DiscordMessage {
   id: string;
   channel_id: string;
@@ -63,6 +83,8 @@ interface DiscordMessage {
   attachments: DiscordAttachment[];
   mentions: DiscordUser[];
   referenced_message?: DiscordMessage | null;
+  message_reference?: DiscordMessageReference | null;
+  message_snapshots?: DiscordMessageSnapshot[];
   flags?: number;
   type: number;
   // Discord populates `thread` on a message when the message has a thread
@@ -157,6 +179,36 @@ async function joinThreadIfNeeded(token: string, threadId: string): Promise<void
     // Archived threads 4xx here — they auto-unarchive on the next message and
     // the catchup sweep still covers them, so this is best-effort by design.
     debugLog(`Thread join failed for ${threadId}: ${err}`);
+  }
+}
+
+// A pasted discord.com/channels/{guild}/{channel}/{message} link in a message's
+// content is a deliberate "this is what I'm talking about" pointer -- e.g. a
+// user typing/pasting a link instead of using Discord's own reply-to feature.
+// If that channel is a thread, route the bot's reply there instead of letting
+// the normal auto-thread-off-this-message logic spin up an unrelated new
+// thread. Registers it in knownThreads (with its real parentId) so downstream
+// thread-session logic treats it exactly like any other known thread.
+const DISCORD_MESSAGE_LINK_RE = /discord\.com\/channels\/\d+\/(\d+)\/\d+/;
+
+async function resolveLinkedThreadChannel(token: string, content: string): Promise<string | null> {
+  const match = content.match(DISCORD_MESSAGE_LINK_RE);
+  if (!match) return null;
+  const linkedChannelId = match[1];
+  if (knownThreads.has(linkedChannelId)) return linkedChannelId;
+  try {
+    const ch = await discordApi<{ id: string; type: number; parent_id?: string }>(
+      token, "GET", `/channels/${linkedChannelId}`,
+    );
+    // Thread channel types: 10 (announcement), 11 (public), 12 (private).
+    if ([10, 11, 12].includes(ch.type) && ch.parent_id) {
+      knownThreads.set(linkedChannelId, { parentId: ch.parent_id });
+      return linkedChannelId;
+    }
+    return null;
+  } catch (err) {
+    debugLog(`Could not resolve linked channel ${linkedChannelId} from message content: ${err}`);
+    return null;
   }
 }
 
@@ -734,7 +786,19 @@ async function catchupThreads(token: string): Promise<void> {
           // Stamp guild_id back on (REST omits it) so the handler routes this
           // as a guild message — threads the reply instead of top-level spam.
           if (!m.guild_id) m.guild_id = await resolveChannelGuildId(token, chId);
-          await handleMessageCreate(token, m);
+          // Dispatched, not awaited: a long Claude session inside one
+          // channel's handler must not block the sweep from reaching every
+          // other candidate, nor from releasing catchupSweeping so the next
+          // 90s tick can run. inFlightThreads (set early inside
+          // handleMessageCreate) guards this channel against re-delivery
+          // while its handler is still in flight. Without this, a single
+          // multi-minute task (e.g. "run these skills against 3 repos")
+          // silently starved every other thread of catchup delivery for its
+          // entire duration — confirmed 2026-07-12: a 23-minute handler
+          // blocked the sweep and left 7 other threads' replies unsent.
+          handleMessageCreate(token, m).catch((err) =>
+            console.error(`[Discord] Catchup delivery failed for channel ${chId}: ${err}`),
+          );
           processed++;
         }
       } catch (err) {
@@ -775,7 +839,12 @@ async function catchupThreads(token: string): Promise<void> {
         if (!newest.guild_id) newest.guild_id = await resolveChannelGuildId(token, threadId);
         // Let handleMessageCreate own recentlyProcessedMessageIds — pre-adding
         // here makes the handler think the message is already processed and exit.
-        await handleMessageCreate(token, newest);
+        // Dispatched, not awaited — see the channel-loop comment above for
+        // why: one long-running thread handler must not block delivery to
+        // every other thread in this sweep, or the next sweep 90s later.
+        handleMessageCreate(token, newest).catch((err) =>
+          console.error(`[Discord] Catchup delivery failed for thread ${threadId}: ${err}`),
+        );
         processed++;
       } catch (err) {
         sweepCursors.delete(threadId); // retry this thread next sweep
@@ -840,6 +909,50 @@ function stopCatchupTimer(): void {
   catchupStartupTimer = null;
   if (livenessTimer) clearInterval(livenessTimer);
   livenessTimer = null;
+}
+
+// --- Forward detection ---
+//
+// Discord's native "Forward" feature reposts a message (often one of the
+// bot's own) into a channel via `message_reference.type === FORWARD` plus
+// `message_snapshots` — never through `content`/`attachments` on the
+// forwarding message itself (Discord docs: a forward "will never have
+// content, embeds, or attachments" of its own). That means a *pure* forward
+// with no added commentary is naturally content-less and already falls out
+// of the router via the empty-content guard.
+//
+// The failure mode this guards against is the forwarded text leaking into
+// `content` anyway (a client/relay quirk) and being mistaken for a fresh,
+// human-typed instruction — reported 3x in one week as a "truncated echo".
+// Since Discord deliberately strips `author` from the snapshot (anti-
+// spoofing), we can't identify whose message it was; instead we compare
+// `content` against the snapshot text itself. If content is empty, or is
+// just the (possibly truncated) snapshot text restated, there's no new
+// instruction here regardless of who originally posted it.
+function normalizeForCompare(text: string): string {
+  return text.trim().replace(/[.…]+$/, "").trim().toLowerCase();
+}
+
+export function classifyForward(
+  message: DiscordMessage,
+): { isForward: boolean; addedText: string; shouldSkip: boolean } {
+  const isForward =
+    message.message_reference?.type === DISCORD_REFERENCE_TYPE_FORWARD &&
+    (message.message_snapshots?.length ?? 0) > 0;
+  if (!isForward) {
+    return { isForward: false, addedText: message.content, shouldSkip: false };
+  }
+
+  const rawContent = message.content.trim();
+  const snapshotText = normalizeForCompare(message.message_snapshots![0].message.content ?? "");
+  const normalizedContent = normalizeForCompare(rawContent);
+  const isEchoOfSnapshot =
+    rawContent.length > 0 &&
+    snapshotText.length > 0 &&
+    (normalizedContent === snapshotText || snapshotText.startsWith(normalizedContent));
+
+  const addedText = rawContent.length === 0 || isEchoOfSnapshot ? "" : rawContent;
+  return { isForward: true, addedText, shouldSkip: addedText.length === 0 };
 }
 
 // --- Guild trigger logic ---
@@ -1039,7 +1152,16 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
   // this is the belt-and-braces for any other REST-sourced delivery path).
   const isGuild = !!message.guild_id || knownThreads.has(message.channel_id);
   const isDM = !isGuild;
-  const content = message.content;
+
+  // Discord "Forward" reposts (often one of the bot's own prior messages)
+  // carry no real content of their own — skip before they can be mistaken
+  // for a fresh instruction. See classifyForward for the detection details.
+  const forwardInfo = classifyForward(message);
+  if (forwardInfo.isForward && forwardInfo.shouldSkip) {
+    debugLog(`Skip forward with no added content id=${message.id} channel=${message.channel_id}`);
+    return;
+  }
+  const content = forwardInfo.isForward ? forwardInfo.addedText : message.content;
 
   // Recover unknown thread channels at message time. Covers every case where
   // knownThreads doesn't have the channel yet: missed THREAD_CREATE,
@@ -1245,6 +1367,18 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
     // Build prompt (same pattern as Telegram)
     const promptParts = [`[Discord from ${label}]`];
+    // Surface Discord reply context in the prompt. When the user uses the
+    // reply UI, Discord populates message.referenced_message with the full
+    // message being replied to — previously that was only used internally
+    // (reply_to_bot trigger detection, thread routing) and never reached the
+    // agent, so a reply to a specific message looked identical to a plain
+    // message typed in a thread.
+    if (message.referenced_message) {
+      const ref = message.referenced_message;
+      const refSpeaker = ref.author?.bot ? "claudeclaw" : (ref.author?.username ?? "unknown");
+      const refBody = (ref.content || "").trim().slice(0, 500) || "[no text content]";
+      promptParts.push(`[Replying to ${refSpeaker}: ${refBody}]`);
+    }
     if (skillContext) {
       const args = cleanContent.trim().slice(command!.length).trim();
       promptParts.push(`<command-name>${command}</command-name>`);
@@ -1272,7 +1406,17 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
     // For guild messages not already in a thread, route the bot's reply into
     // a thread BEFORE running Claude so the reply (and follow-ups) live in
-    // the thread instead of cluttering the channel. Two-step routing:
+    // the thread instead of cluttering the channel. Three-step routing:
+    //   0. If the message contains a pasted discord.com/channels/.../.../...
+    //      link, treat that as an explicit "reply over there" instruction —
+    //      stronger than a native Discord reply, since the user typed/pasted
+    //      it deliberately to point at a specific existing conversation.
+    //      Without this, pasting a link to another thread (instead of using
+    //      Discord's own reply-to feature) still fell through to step 2 and
+    //      auto-created a BRAND NEW unrelated thread, so the bot's answer
+    //      landed somewhere the user never intended and never saw (caught
+    //      2026-08-26: user linked a message inside an active thread three
+    //      separate times and each time got a fresh disconnected thread).
     //   1. If the user's message is a reply-to a message that already has a
     //      thread, reuse that thread. This is the common art-channel case:
     //      bot posts art → auto-creates thread A → user uses Discord's reply
@@ -1283,7 +1427,13 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     let replyChannelId = channelId;
     const inKnownThread = knownThreads.has(channelId);
     if (isGuild && !inKnownThread) {
-      const refThreadId = message.referenced_message?.thread?.id;
+      const linkedChannelId = await resolveLinkedThreadChannel(config.token, cleanContent);
+      const refThreadId = linkedChannelId ?? message.referenced_message?.thread?.id;
+      if (linkedChannelId) {
+        console.log(
+          `[Discord] Routed reply into thread ${linkedChannelId.slice(0, 8)} from a pasted message link in content`,
+        );
+      }
       if (refThreadId) {
         knownThreads.set(refThreadId, { parentId: channelId });
         await joinThreadIfNeeded(config.token, refThreadId);
