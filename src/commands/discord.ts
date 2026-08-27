@@ -1542,21 +1542,25 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
           console.error(`[Discord] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
-      const finalText = textWithoutImages || (imagePaths.length > 0 ? "" : "(empty response)");
-      const sentId = imagePaths.length > 0
-        ? await sendMessageWithFiles(config.token, replyChannelId, finalText, imagePaths).catch((err) => {
-            console.error(`[Discord] Image upload failed for ${label}: ${err instanceof Error ? err.message : err}`);
-            return sendMessage(config.token, replyChannelId, finalText || "(image upload failed)");
-          })
-        : await sendMessage(config.token, replyChannelId, finalText);
-      if (sentId) {
-        recordResponse({
-          messageId: sentId,
-          channelId: replyChannelId,
-          userId,
-          prompt: cleanContent || (voiceTranscript ? `(voice) ${voiceTranscript}` : "(no text)"),
-          response: finalText,
-        }).catch((err) => debugLog(`Failed to record response: ${err}`));
+      const finalText = textWithoutImages;
+      if (!finalText && imagePaths.length === 0) {
+        debugLog(`[Discord] Empty response for ${label}, staying silent`);
+      } else {
+        const sentId = imagePaths.length > 0
+          ? await sendMessageWithFiles(config.token, replyChannelId, finalText, imagePaths).catch((err) => {
+              console.error(`[Discord] Image upload failed for ${label}: ${err instanceof Error ? err.message : err}`);
+              return sendMessage(config.token, replyChannelId, finalText || "(image upload failed)");
+            })
+          : await sendMessage(config.token, replyChannelId, finalText);
+        if (sentId) {
+          recordResponse({
+            messageId: sentId,
+            channelId: replyChannelId,
+            userId,
+            prompt: cleanContent || (voiceTranscript ? `(voice) ${voiceTranscript}` : "(no text)"),
+            response: finalText,
+          }).catch((err) => debugLog(`Failed to record response: ${err}`));
+        }
       }
     }
   } catch (err) {
