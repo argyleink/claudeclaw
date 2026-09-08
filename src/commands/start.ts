@@ -16,6 +16,11 @@ const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
 const STATUSLINE_FILE = join(CLAUDE_DIR, "statusline.cjs");
 const CLAUDE_SETTINGS_FILE = join(CLAUDE_DIR, "settings.json");
 const PREFLIGHT_SCRIPT = fileURLToPath(new URL("../preflight.ts", import.meta.url));
+// Job-status/error DMs (forwardToDiscord/forwardToTelegram, guardHeartbeatFailure)
+// go to the owner only. discord.allowedUserIds also authorizes guests (e.g.
+// Robbie) to trigger the bot in threads/channels -- that's a different concern
+// from who gets proactive "a job failed" pings, and guests should never get those.
+const OWNER_DISCORD_USER_ID = "472250281946775553";
 
 // --- Statusline setup/teardown ---
 
@@ -523,15 +528,15 @@ export async function start(args: string[] = []) {
   }
 
   function forwardToDiscord(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
-    if (!discordSendToUser || currentSettings.discord.allowedUserIds.length === 0) return;
+    // Owner only -- job-status/error DMs are never sent to other allowedUserIds
+    // (e.g. guests), who are only on that list to be allowed to trigger the bot.
+    if (!discordSendToUser || !currentSettings.discord.allowedUserIds.includes(OWNER_DISCORD_USER_ID)) return;
     const text = result.exitCode === 0
       ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
       : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
-    for (const userId of currentSettings.discord.allowedUserIds) {
-      discordSendToUser(userId, text).catch((err) =>
-        console.error(`[Discord] Failed to forward to ${userId}: ${err}`)
-      );
-    }
+    discordSendToUser(OWNER_DISCORD_USER_ID, text).catch((err) =>
+      console.error(`[Discord] Failed to forward to ${OWNER_DISCORD_USER_ID}: ${err}`)
+    );
   }
 
   // --- Heartbeat failure guard ---
@@ -557,10 +562,9 @@ export async function start(args: string[] = []) {
         telegramSend(userId, text).catch((err) => console.error(`[Telegram] Failed to forward to ${userId}: ${err}`));
       }
     }
-    if (discordSendToUser) {
-      for (const userId of currentSettings.discord.allowedUserIds) {
-        discordSendToUser(userId, text).catch((err) => console.error(`[Discord] Failed to forward to ${userId}: ${err}`));
-      }
+    // Owner only -- heartbeat-failure pings are not for guests on the allow-list.
+    if (discordSendToUser && currentSettings.discord.allowedUserIds.includes(OWNER_DISCORD_USER_ID)) {
+      discordSendToUser(OWNER_DISCORD_USER_ID, text).catch((err) => console.error(`[Discord] Failed to forward to ${OWNER_DISCORD_USER_ID}: ${err}`));
     }
   }
 
@@ -738,6 +742,9 @@ export async function start(args: string[] = []) {
 
   updateState();
 
+  const jobFailureState = new Map<string, { notifiedDown: boolean; lastNotifiedAt: number }>();
+  const JOB_FAILURE_REMINDER_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
   setInterval(() => {
     const now = new Date();
     for (const job of currentJobs) {
@@ -746,7 +753,28 @@ export async function start(args: string[] = []) {
           .then((prompt) => job.shell ? runShell(job.name, prompt) : run(job.name, prompt))
           .then((r) => {
             if (job.notify === false) return;
-            if (job.notify === "error" && r.exitCode === 0) return;
+            if (job.notify === "error") {
+              // Edge-triggered: one DM when a recurring job starts failing, one
+              // when it recovers, and a periodic reminder while it's still down
+              // -- never one DM per failing tick. A job stuck failing every
+              // 15min used to fire dozens of duplicate DMs over hours.
+              const state = jobFailureState.get(job.name) ?? { notifiedDown: false, lastNotifiedAt: 0 };
+              if (r.exitCode === 0) {
+                if (state.notifiedDown) {
+                  forwardToTelegram(`${job.name} recovered`, r);
+                  forwardToDiscord(`${job.name} recovered`, r);
+                }
+                jobFailureState.delete(job.name);
+                return;
+              }
+              if (state.notifiedDown && Date.now() - state.lastNotifiedAt < JOB_FAILURE_REMINDER_COOLDOWN_MS) {
+                return;
+              }
+              jobFailureState.set(job.name, { notifiedDown: true, lastNotifiedAt: Date.now() });
+              forwardToTelegram(job.name, r);
+              forwardToDiscord(job.name, r);
+              return;
+            }
             forwardToTelegram(job.name, r);
             forwardToDiscord(job.name, r);
           })
