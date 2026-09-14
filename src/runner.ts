@@ -119,6 +119,17 @@ const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
 //       failsafe posts one outage alert — per-job spam helps nobody).
 const CLAUDE_DOWN_PATTERN = /Executable not found in \$?PATH|is not recognized as an internal|cannot find the (?:path|file) specified|spawn .+ENOENT|no such file or directory/i;
 const FAILSAFE_STATE_FILE = join(process.cwd(), ".claude/claudeclaw/claude-failsafe.json");
+
+// A resumed session whose accumulated transcript has grown past the model's
+// context window fails fast (exit 1, not a timeout) with a message like
+// "Prompt is too long" — found 2026-09-14 when a 23-turn thread hit this and
+// the existing auto-compact-on-timeout safety net (exitCode === 124 below)
+// never caught it, surfacing the raw CLI error to Discord instead of
+// self-healing. Treat this as the same "context overflow" case as a timeout.
+const CONTEXT_OVERFLOW_PATTERN = /prompt is too long|context length exceeded|maximum context length/i;
+function isContextOverflowError(exec: { stderr: string; rawStdout: string }): boolean {
+  return CONTEXT_OVERFLOW_PATTERN.test(exec.stderr) || CONTEXT_OVERFLOW_PATTERN.test(exec.rawStdout);
+}
 const FAILSAFE_SCRIPT = join(process.cwd(), ".claude/claudeclaw/scripts/claude-failsafe.mjs");
 const USER_FACING_NAMES = new Set(["discord", "telegram", "send", "prompt"]);
 const FAILSAFE_STATE_FRESH_MS = 20 * 60 * 1000;
@@ -530,11 +541,20 @@ export async function runCompact(
 
 /**
  * High-level compact: resolves session + settings internally.
+ * Pass threadId to compact that thread's own session instead of the global
+ * one — found 2026-09-14 that the Discord /compact command always compacted
+ * the global session even when run inside a thread with its own session,
+ * silently no-oping on the thread that actually needed it.
  * Returns { success, message }.
  */
-export async function compactCurrentSession(): Promise<{ success: boolean; message: string }> {
-  const existing = await getSession();
-  if (!existing) return { success: false, message: "No active session to compact." };
+export async function compactCurrentSession(threadId?: string): Promise<{ success: boolean; message: string }> {
+  const existing = threadId ? await getThreadSession(threadId) : await getSession();
+  if (!existing) {
+    return {
+      success: false,
+      message: threadId ? "No active session for this thread to compact." : "No active session to compact.",
+    };
+  }
 
   const settings = getSettings();
   const securityArgs = buildSecurityArgs(settings.security);
@@ -750,8 +770,13 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   if (appendParts.length > 0) unlink(syspromptFile).catch(() => {});
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
 
-  // --- Auto-compact on timeout (exit 124) ---
-  if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing) {
+  // --- Auto-compact on timeout (exit 124) or context overflow ("Prompt is too long") ---
+  const isTimeout = exitCode === 124;
+  const isContextOverflow = exitCode !== 0 && isContextOverflowError(exec);
+  if (COMPACT_TIMEOUT_ENABLED && (isTimeout || isContextOverflow) && !isNew && existing) {
+    if (isContextOverflow) {
+      console.warn(`[${new Date().toLocaleTimeString()}] Context overflow detected for ${name} (exit ${exitCode}); auto-compacting...`);
+    }
     emitCompactEvent({ type: "auto-compact-start" });
     const compactOk = await runCompact(
       existing.sessionId,

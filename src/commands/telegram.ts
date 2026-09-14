@@ -856,7 +856,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         }
       }
       if (!cleanedText && filePaths.length === 0) {
-        await sendMessage(config.token, chatId, "(empty response)", threadId);
+        debugLog(`[Telegram] Empty response for ${label}, staying silent`);
       }
     }
   } catch (err) {
